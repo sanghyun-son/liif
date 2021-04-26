@@ -1,7 +1,9 @@
+from os import path
 import functools
 import random
 import math
 from PIL import Image
+import typing
 
 import numpy as np
 import torch
@@ -10,6 +12,57 @@ from torchvision import transforms
 
 from datasets import register
 from utils import to_pixel_samples
+
+
+@register('srwarp-train')
+class SRWarp(Dataset):
+
+    def __init__(
+            self,
+            dataset,
+            inp_size: int=384,
+            augment: bool=True,
+            sample_q: int=-1) -> None:
+
+        ms = torch.load(path.join('misc', 'sample_384.pth'))
+        self.ms = ms['train']
+
+        self.dataset = dataset
+        self.inp_size = ms['input_size']
+        self.augment = augment
+        return
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int) -> typing.Mapping[str, torch.Tensor]:
+        img = self.dataset[idx]
+        _, h, w = img.size()
+        px = random.randrange(0, w - self.inp_size + 1)
+        py = random.randrange(0, h - self.inp_size + 1)
+        img = img[..., py:(py + self.inp_size), px:(px + self.inp_size)]
+
+        if self.augment:
+            hflip = random.random() < 0.5
+            vflip = random.random() < 0.5
+            dflip = random.random() < 0.5
+
+            def augment(x: torch.Tensor) -> torch.Tensor:
+                if hflip:
+                    x = x.flip(-2)
+                if vflip:
+                    x = x.flip(-1)
+                if dflip:
+                    x = x.transpose(-2, -1)
+                return x
+
+            img = augment(img)
+
+        m = random.choice(self.ms)
+        m = m.double()
+
+        ret_dict = {'inp': img, 'm': m}
+        return ret_dict
 
 
 @register('sr-implicit-paired')
