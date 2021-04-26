@@ -107,6 +107,42 @@ def train(train_loader, model, optimizer):
         pred = model(inp, batch['coord'], batch['cell'])
 
         gt = (batch['gt'] - gt_sub) / gt_div
+        print(pred.size(), gt.size())
+        loss = loss_fn(pred, gt)
+
+        train_loss.add(loss.item())
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        pred = None; loss = None
+
+    return train_loss.item()
+
+
+def train_warp(train_loader, model, optimizer):
+    model.train()
+    loss_fn = nn.L1Loss()
+    train_loss = utils.Averager()
+
+    data_norm = config['data_norm']
+    t = data_norm['inp']
+    inp_sub = torch.FloatTensor(t['sub']).view(1, -1, 1, 1).cuda()
+    inp_div = torch.FloatTensor(t['div']).view(1, -1, 1, 1).cuda()
+    t = data_norm['gt']
+    gt_sub = torch.FloatTensor(t['sub']).view(1, 1, -1).cuda()
+    gt_div = torch.FloatTensor(t['div']).view(1, 1, -1).cuda()
+
+    for batch in tqdm(train_loader, leave=False, desc='train'):
+        for k, v in batch.items():
+            batch[k] = v.cuda()
+
+        inp = (batch['inp'] - inp_sub) / inp_div
+        pred = model(inp, batch['coord'], batch['cell'])
+
+        gt = (batch['gt'] - gt_sub) / gt_div
+        print(pred.size(), gt.size())
         loss = loss_fn(pred, gt)
 
         train_loss.add(loss.item())

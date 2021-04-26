@@ -6,7 +6,7 @@ import math
 import torch
 import numpy as np
 from torch.optim import SGD, Adam
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 
 
 class Averager():
