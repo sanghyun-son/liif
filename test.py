@@ -1,6 +1,7 @@
 import argparse
 import os
 import math
+import random
 from functools import partial
 
 import yaml
@@ -11,6 +12,12 @@ from tqdm import tqdm
 import datasets
 import models
 import utils
+
+from srwarp import crop
+from srwarp import transform
+from srwarp import grid
+from srwarp import warp
+import warp_utils
 
 
 def batched_predict(model, inp, coord, cell, bsize):
@@ -28,8 +35,11 @@ def batched_predict(model, inp, coord, cell, bsize):
     return pred
 
 
-def eval_psnr(loader, model, data_norm=None, eval_type=None, eval_bsize=None,
-              verbose=False):
+@torch.no_grad()
+def eval_warp_psnr(
+        loader, model, data_norm=None, eval_type=None, eval_bsize=None,
+        verbose=False):
+
     model.eval()
 
     if data_norm is None:
@@ -40,49 +50,52 @@ def eval_psnr(loader, model, data_norm=None, eval_type=None, eval_bsize=None,
     t = data_norm['inp']
     inp_sub = torch.FloatTensor(t['sub']).view(1, -1, 1, 1).cuda()
     inp_div = torch.FloatTensor(t['div']).view(1, -1, 1, 1).cuda()
-    t = data_norm['gt']
-    gt_sub = torch.FloatTensor(t['sub']).view(1, 1, -1).cuda()
-    gt_div = torch.FloatTensor(t['div']).view(1, 1, -1).cuda()
 
-    if eval_type is None:
-        metric_fn = utils.calc_psnr
-    elif eval_type.startswith('div2k'):
-        scale = int(eval_type.split('-')[1])
-        metric_fn = partial(utils.calc_psnr, dataset='div2k', scale=scale)
-    elif eval_type.startswith('benchmark'):
-        scale = int(eval_type.split('-')[1])
-        metric_fn = partial(utils.calc_psnr, dataset='benchmark', scale=scale)
-    else:
-        raise NotImplementedError
-
+    metric_fn = utils.calc_psnr
     val_res = utils.Averager()
 
-    pbar = tqdm(loader, leave=False, desc='val')
+    pbar = tqdm(loader, leave=False, desc='val', ncols=80)
     for batch in pbar:
-        for k, v in batch.items():
-            batch[k] = v.cuda()
+        gt_ref = batch['inp'].cuda()
+        gt = (gt_ref - inp_sub) / inp_div
 
-        inp = (batch['inp'] - inp_sub) / inp_div
-        if eval_bsize is None:
-            with torch.no_grad():
-                pred = model(inp, batch['coord'], batch['cell'])
-        else:
-            pred = batched_predict(model, inp,
-                batch['coord'], batch['cell'], eval_bsize)
-        pred = pred * gt_div + gt_sub
+        m_inv = batch['m']
+        m_inv = random.choice(m_inv)
+        lr_crop, m = warp_utils.get_input(gt, m_inv, stochastic=False)
+        m_inv_comp = transform.inverse_3x3(m)
+
+        sizes = (gt.size(-2), gt.size(-1))
+        sizes_source = (lr_crop.size(-2), lr_crop.size(-1))
+
+        grid_raw, yi = grid.get_safe_projective_grid(
+            m_inv_comp,
+            sizes,
+            sizes_source,
+        )
+        coord = grid.convert_coord(grid_raw, sizes_source)
+        coord = coord.view(1, coord.size(0), coord.size(1))
+        cell = torch.ones_like(coord)
+        cell[..., 0] *= 2 / gt.size(-1)
+        cell[..., 1] *= 2 / gt.size(-2)
+
+        pred = batched_predict(model, lr_crop, coord, cell, 16384)
+        pred = pred * inp_div + inp_sub
         pred.clamp_(0, 1)
 
-        if eval_type is not None: # reshape for shaving-eval
-            ih, iw = batch['inp'].shape[-2:]
-            s = math.sqrt(batch['coord'].shape[1] / (ih * iw))
-            shape = [batch['inp'].shape[0], round(ih * s), round(iw * s), 3]
-            pred = pred.view(*shape) \
-                .permute(0, 3, 1, 2).contiguous()
-            batch['gt'] = batch['gt'].view(*shape) \
-                .permute(0, 3, 1, 2).contiguous()
+        ignore_value = -255
+        shave = 4
+        pred_full = torch.full_like(gt, ignore_value)
+        pred_full = pred_full.view(pred_full.size(0), pred_full.size(1), -1)
+        pred_full[..., yi] = pred.transpose(-2, -1)
+        pred_full = pred_full.view(gt.size())
+        mask = (pred_full != ignore_value).float()
 
-        res = metric_fn(pred, batch['gt'])
-        val_res.add(res.item(), inp.shape[0])
+        diff = mask * (pred_full - gt_ref)
+        diff = diff[..., shave:-shave, shave:-shave]
+        gain = mask.nelement() / mask.sum()
+        mse = gain.item() * diff.pow(2).mean()
+        res = -10 * mse.log10()
+        val_res.add(res.item(), 1)
 
         if verbose:
             pbar.set_description('val {:.4f}'.format(val_res.item()))

@@ -32,16 +32,18 @@ import torch.nn as nn
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import MultiStepLR
+from torchvision import utils as vutils
 
 import datasets
 import models
 import utils
-from test import eval_psnr
+import test
 
 from srwarp import crop
 from srwarp import transform
 from srwarp import grid
 from srwarp import warp
+import warp_utils
 
 
 def make_data_loader(spec, tag=''):
@@ -93,80 +95,9 @@ def prepare_training():
     return model, optimizer, epoch_start, lr_scheduler
 
 
-'''
-def train(train_loader, model, optimizer):
-    model.train()
-    loss_fn = nn.L1Loss()
-    train_loss = utils.Averager()
-
-    data_norm = config['data_norm']
-    t = data_norm['inp']
-    inp_sub = torch.FloatTensor(t['sub']).view(1, -1, 1, 1).cuda()
-    inp_div = torch.FloatTensor(t['div']).view(1, -1, 1, 1).cuda()
-    t = data_norm['gt']
-    gt_sub = torch.FloatTensor(t['sub']).view(1, 1, -1).cuda()
-    gt_div = torch.FloatTensor(t['div']).view(1, 1, -1).cuda()
-
-    for batch in tqdm(train_loader, leave=False, desc='train'):
-        for k, v in batch.items():
-            batch[k] = v.cuda()
-
-        inp = (batch['inp'] - inp_sub) / inp_div
-        pred = model(inp, batch['coord'], batch['cell'])
-
-        gt = (batch['gt'] - gt_sub) / gt_div
-        loss = loss_fn(pred, gt)
-
-        train_loss.add(loss.item())
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        pred = None; loss = None
-
-    return train_loss.item()
-'''
-
-@torch.no_grad()
-def quantize(x: torch.Tensor) -> torch.Tensor:
-    x = 127.5 * (x + 1)
-    x = x.clamp(min=0, max=255)
-    x = x.round()
-    x = x / 127.5 - 1
-    return x
-
-@torch.no_grad()
-def get_input(
-        gt: torch.Tensor,
-        m_inv: torch.Tensor) -> typing.Tuple[torch.Tensor, torch.Tensor]:
-
-    m_inv, sizes, _ = transform.compensate_matrix(gt, m_inv)
-    m = transform.inverse_3x3(m_inv)
-
-    ignore_value = -255
-    lr = warp.warp_by_function(
-        gt,
-        m,
-        sizes=sizes,
-        kernel_type='bicubic',
-        adaptive_grid=True,
-        fill=ignore_value,
-    )
-
-    patch_max = 96
-    lr_crop, iy, ix = crop.valid_crop(
-        lr,
-        ignore_value,
-        patch_max=patch_max,
-        stochastic=True,
-    )
-    lr_crop = quantize(lr_crop)
-    m = transform.compensate_offset(m, ix, iy)
-    return lr_crop, m
-
 def train_warp(train_loader, model, optimizer):
-    num_samples = 4096
+    #num_samples = 4096
+    num_samples = -1
 
     model.train()
     loss_fn = nn.L1Loss()
@@ -177,52 +108,67 @@ def train_warp(train_loader, model, optimizer):
     inp_sub = torch.FloatTensor(t['sub']).view(1, -1, 1, 1).cuda()
     inp_div = torch.FloatTensor(t['div']).view(1, -1, 1, 1).cuda()
 
-    for batch in tqdm(train_loader, leave=False, desc='train'):
+    tq = tqdm(train_loader, leave=False, desc='train')
+    for batch in tq:
         # Data preprocessing
         with torch.no_grad():
             gt = batch['inp'].cuda()
             gt -= inp_sub
             gt /= inp_div
 
-        # m is also batched
-        m_inv = batch['m']
-        m_inv = random.choice(m_inv)
-        lr_crop, m = get_input(gt, m_inv)
-        m_inv_comp = transform.inverse_3x3(m)
+            # m is also batched
+            m_inv = batch['m']
+            m_inv = random.choice(m_inv)
+            lr_crop, m = warp_utils.get_input(gt, m_inv)
+            m_inv_comp = transform.inverse_3x3(m)
 
-        sizes = (gt.size(-2), gt.size(-1))
-        sizes_source = (lr_crop.size(-2), lr_crop.size(-1))
+            sizes = (gt.size(-2), gt.size(-1))
+            sizes_source = (lr_crop.size(-2), lr_crop.size(-1))
 
-        # grid_raw: (2, 78768)
-        grid_raw, yi = grid.get_safe_projective_grid(
-            m_inv_comp,
-            sizes,
-            sizes_source,
-        )
-        # grid_liif: (78768, 2)
-        grid_liif = grid.convert_coord(grid_raw, sizes_source)
-        gt_flat = gt.view(gt.size(0), gt.size(1), -1)
+            # grid_raw: (2, N)
+            # yi indicates the indices of valid positions in gt
+            grid_raw, yi = grid.get_safe_projective_grid(
+                m_inv_comp,
+                sizes,
+                sizes_source,
+            )
+            # grid_liif: (N, 2)
+            grid_liif = grid.convert_coord(grid_raw, sizes_source)
+            gt_flat = gt.view(gt.size(0), gt.size(1), -1)
 
-        probs = yi.new_ones(yi.nelement())
-        probs = probs.float()
-        idx = torch.multinomial(probs, num_samples, replacement=True)
+            probs = yi.new_ones(yi.nelement())
+            probs = probs.float()
+            if num_samples > 0:
+                idx = torch.multinomial(probs, num_samples, replacement=True)
+                coord = grid_liif[idx]
+            else:
+                coord = grid_liif
 
-        coord = grid_liif[idx]
-        cell = torch.ones_like(coord)
-        cell[:, 0] *= 2 / gt.size(-1)
-        cell[:, 1] *= 2 / gt.size(-2)
+            # Let's assume that the transformation is shared in a single batch
+            coord = coord.repeat(gt.size(0), 1, 1)
+            cell = torch.ones_like(coord)
+            cell[..., 0] *= 2 / gt.size(-1)
+            cell[..., 1] *= 2 / gt.size(-2)
+
         pred = model(lr_crop, coord, cell)
 
-        gt_pix = gt_flat[..., idx]
+        if num_samples > 0:
+            gt_pix = gt_flat[..., yi[idx]]
+        else:
+            gt_pix = gt_flat[..., yi]
+
+        gt_pix = gt_pix.transpose(-2, -1)
         loss = loss_fn(pred, gt_pix)
 
+        tq.set_description(f'Loss: {loss.item():.4f}')
         train_loss.add(loss.item())
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        pred = None; loss = None
+        pred = None
+        loss = None
 
     return train_loss.item()
 
@@ -292,7 +238,7 @@ def main(config_, save_path):
                 model_ = model.module
             else:
                 model_ = model
-            val_res = eval_psnr(val_loader, model_,
+            val_res = test.eval_warp_psnr(val_loader, model_,
                 data_norm=config['data_norm'],
                 eval_type=config.get('eval_type'),
                 eval_bsize=config.get('eval_bsize'))

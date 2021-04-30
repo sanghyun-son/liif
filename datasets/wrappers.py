@@ -64,6 +64,39 @@ class SRWarp(Dataset):
         ret_dict = {'inp': img, 'm': m}
         return ret_dict
 
+@register('srwarp-eval')
+class SRWarp(Dataset):
+
+    def __init__(
+            self,
+            dataset,
+            inp_size: int=384,
+            augment: bool=True,
+            sample_q: int=-1) -> None:
+
+        ms = torch.load(path.join('misc', 'sample_384.pth'))
+        self.ms = ms['eval']
+
+        self.dataset = dataset
+        self.inp_size = ms['input_size']
+        self.augment = augment
+        return
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int) -> typing.Mapping[str, torch.Tensor]:
+        img = self.dataset[idx]
+        _, h, w = img.size()
+        px = (w - self.inp_size) // 2
+        py = (h - self.inp_size) // 2
+        img = img[..., py:(py + self.inp_size), px:(px + self.inp_size)]
+
+        m = self.ms[idx]
+        m = m.double()
+
+        ret_dict = {'inp': img, 'm': m}
+        return ret_dict
 
 @register('sr-implicit-paired')
 class SRImplicitPaired(Dataset):
